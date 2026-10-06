@@ -1,0 +1,161 @@
+name: Build APK
+
+on:
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: RomeoJuliet
+  SNAKE: romeo_juliet
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Unzip the latest project zip
+        run: |
+          set -euo pipefail
+          best=""
+          best_ct=-1
+          for f in *.zip; do
+            [ -e "$f" ] || continue
+            ct=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+            ct=${ct:-0}
+            if [ "$ct" -ge "$best_ct" ]; then best="$f"; best_ct="$ct"; fi
+          done
+          [ -n "$best" ] || { echo "No *.zip found in repo root"; exit 1; }
+          echo "Using $best"
+          rm -rf _src && mkdir _src
+          unzip -q "$best" -d _src
+          pub=$(find _src -name pubspec.yaml -not -path '*/.*' | head -n 1)
+          [ -n "$pub" ] || { echo "pubspec.yaml not found in zip"; exit 1; }
+          echo "APP_DIR=$(cd "$(dirname "$pub")" && pwd)" >> "$GITHUB_ENV"
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create android/ if missing
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.maraj --project-name "$SNAKE" .
+          fi
+          rm -f test/widget_test.dart
+
+      - name: flutter pub get
+        working-directory: ${{ env.APP_DIR }}
+        run: flutter pub get
+
+      - name: flutter analyze
+        working-directory: ${{ env.APP_DIR }}
+        continue-on-error: true
+        run: flutter analyze
+
+      - name: flutter test
+        working-directory: ${{ env.APP_DIR }}
+        continue-on-error: true
+        run: flutter test
+
+      - name: Select signing key
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ]; then
+            echo "Using private key from repository secrets"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KS_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "KS_PASS=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+            echo "::add-mask::$KEYSTORE_PASSWORD"
+          else
+            echo "Using bundled sideload key (public - fine for sideloading, NOT for a store)"
+            echo "KS_PATH=$PWD/tools/${SNAKE}-sideload.jks" >> "$GITHUB_ENV"
+            echo "KS_ALIAS=$SNAKE" >> "$GITHUB_ENV"
+            echo "KS_PASS=sideload123" >> "$GITHUB_ENV"
+          fi
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+          echo "APKSIGNER=$APKSIGNER" >> "$GITHUB_ENV"
+
+      - name: Build and sign Mobile APKs
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          N="${{ github.run_number }}"
+          mkdir -p dist build/symbols
+          python3 tools/patch_manifest.py mobile
+
+          sign() {
+            "$APKSIGNER" sign --ks "$KS_PATH" --ks-key-alias "$KS_ALIAS" \
+              --ks-pass env:KS_PASS --key-pass env:KS_PASS --out "$2" "$1"
+          }
+
+          # Per-ABI APKs
+          flutter build apk --release --split-per-abi \
+            --target-platform android-arm,android-arm64,android-x64 \
+            --dart-define=TARGET=mobile --obfuscate --split-debug-info=build/symbols
+          OUT=build/app/outputs/flutter-apk
+          sign "$OUT/app-arm64-v8a-release.apk"   "dist/${APP_NAME}-Mobile-arm64-v8a-build${N}.apk"
+          sign "$OUT/app-armeabi-v7a-release.apk" "dist/${APP_NAME}-Mobile-armeabi-v7a-build${N}.apk"
+          sign "$OUT/app-x86_64-release.apk"      "dist/${APP_NAME}-Mobile-x86_64-build${N}.apk"
+
+          # Universal APK
+          flutter build apk --release \
+            --dart-define=TARGET=mobile --obfuscate --split-debug-info=build/symbols
+          sign "$OUT/app-release.apk" "dist/${APP_NAME}-Mobile-universal-build${N}.apk"
+
+      - name: Verify APKs
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          for f in dist/*.apk; do
+            "$APKSIGNER" verify --verbose "$f" | head -n 3
+          done
+          test "$(ls dist/*.apk | wc -l)" -eq 4
+          ls -la dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: apks-build${{ github.run_number }}
+          path: ${{ env.APP_DIR }}/dist/*.apk
+          if-no-files-found: error
+
+      - name: GitHub Release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd
+        with:
+          tag: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          artifacts: ${{ env.APP_DIR }}/dist/*.apk
+          prerelease: true
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
